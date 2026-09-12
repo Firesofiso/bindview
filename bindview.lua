@@ -47,6 +47,7 @@ local defaultSettings = T{
     currentProfile = '',       -- profile currently applied (display only)
     autoLoad   = true,         -- on job change, apply that job's last-used or default profile
     lastProfile = T{},         -- job abbr -> last profile loaded for that job
+    silentBinds = true,        -- suppress Ashita's bind/unbind chat lines while applying profiles
     position_x = 40,
     position_y = 300,
     -- Commands that are bound by the launcher / system and are not actions.
@@ -92,6 +93,7 @@ local cfg = {
     keyColor   = { 1.0, 0.95, 0.55, 1.0 },
     showProfileName = { true },
     autoLoad   = { true },
+    silentBinds = { true },
 };
 
 local LAYOUT_NAMES = T{ 'Keyboard', 'Grid' };
@@ -114,6 +116,7 @@ local function SyncConfigFromSettings()
     cfg.keyBadge[1] = (s.keyBadge ~= false);
     cfg.showProfileName[1] = (s.showProfileName ~= false);
     cfg.autoLoad[1] = (s.autoLoad ~= false);
+    cfg.silentBinds[1] = (s.silentBinds ~= false);
     local kc = s.keyColor or defaultSettings.keyColor;
     cfg.keyColor[1], cfg.keyColor[2], cfg.keyColor[3], cfg.keyColor[4] = kc[1], kc[2], kc[3], kc[4];
 end
@@ -136,6 +139,7 @@ local function SyncSettingsFromConfig()
     s.keyColor   = T{ cfg.keyColor[1], cfg.keyColor[2], cfg.keyColor[3], cfg.keyColor[4] };
     s.showProfileName = cfg.showProfileName[1];
     s.autoLoad = cfg.autoLoad[1];
+    s.silentBinds = cfg.silentBinds[1];
 end
 
 settings.register('settings', 'settings_update', function(s)
@@ -676,6 +680,36 @@ end
 
 local DEFAULT_PROFILE = 'default';
 
+-- Silent binds: Ashita prints a chat line for every /bind and /unbind unless
+-- the keyboard manager's silent flag is set. The commands we issue are queued,
+-- not run immediately, so the flag is raised now and restored by a marker
+-- command queued after them; the queue is processed in order.
+local SILENT_END_COMMAND = '/bindview _endsilent';
+local silentPrevious = nil;
+
+local function BeginSilentBinds()
+    if bv.settings.silentBinds == false then return; end
+    local kb = AshitaCore:GetInputManager():GetKeyboard();
+    if not kb or not kb.SetSilentBinds then return; end
+    if silentPrevious == nil then
+        silentPrevious = kb:GetSilentBinds();
+    end
+    kb:SetSilentBinds(true);
+end
+
+local function QueueSilentEnd(cm)
+    if bv.settings.silentBinds == false then return; end
+    cm:QueueCommand(1, SILENT_END_COMMAND);
+end
+
+local function EndSilentBinds()
+    local kb = AshitaCore:GetInputManager():GetKeyboard();
+    if kb and kb.SetSilentBinds and silentPrevious ~= nil then
+        kb:SetSilentBinds(silentPrevious);
+    end
+    silentPrevious = nil;
+end
+
 -- Current main job abbreviation ('BLM'), or nil when not logged in.
 local function CurrentJob()
     local player = AshitaCore:GetMemoryManager():GetPlayer();
@@ -771,6 +805,7 @@ local function LoadProfile(name)
     if not data then return false, err; end
 
     local cm = AshitaCore:GetChatManager();
+    BeginSilentBinds();
 
     -- Release everything bindview currently tracks (never the hidden system binds).
     for _, b in ipairs(bv.binds) do
@@ -787,6 +822,7 @@ local function LoadProfile(name)
             count = count + 1;
         end
     end
+    QueueSilentEnd(cm);
 
     bv.settings.currentProfile = name;
     if not bv.settings.lastProfile then bv.settings.lastProfile = T{}; end
@@ -869,11 +905,14 @@ local function CheckJobChange()
     -- bindview issued itself; binds set by anything else are left alone.
     if previousJob ~= nil then
         local cm = AshitaCore:GetChatManager();
+        local any = false;
         for _, b in ipairs(bv.binds) do
             if b.own then
+                if not any then BeginSilentBinds(); any = true; end
                 cm:QueueCommand(1, '/unbind ' .. b.key);
             end
         end
+        if any then QueueSilentEnd(cm); end
     end
 
     if not job then return; end
@@ -933,6 +972,12 @@ ashita.events.register('command', 'command_cb', function(e)
         return;
     end
     e.blocked = true;
+
+    -- Internal marker queued after a batch of binds: restore the silent flag.
+    if #args == 2 and args[2] == '_endsilent' then
+        EndSilentBinds();
+        return;
+    end
 
     local s = bv.settings;
     if #args == 1 or args[2]:any('toggle') then
@@ -1627,6 +1672,9 @@ local function DrawProfilesSection()
     if imgui.Checkbox('Auto-apply job profile on job change', cfg.autoLoad) then
         profileSectionChanged = true;
     end
+    if imgui.Checkbox('Hide bind/unbind chat messages', cfg.silentBinds) then
+        profileSectionChanged = true;
+    end
     imgui.TextDisabled('Applies the job\'s last-used profile, or "default" if one exists.');
 
     if profileUi.names == nil or profileUi.job ~= job or bv.profileListDirty then
@@ -1805,5 +1853,6 @@ ashita.events.register('load', 'load_cb', function()
 end);
 
 ashita.events.register('unload', 'unload_cb', function()
+    EndSilentBinds();
     SaveSettings();
 end);
