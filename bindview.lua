@@ -44,7 +44,9 @@ local defaultSettings = T{
     keyBadge   = true,         -- solid dark badge behind the key label
     keyColor   = T{ 1.0, 0.95, 0.55, 1.0 },   -- key label color (RGBA 0-1)
     showProfileName = true,    -- draw the active profile name above the slots
-    currentProfile = '',       -- last profile loaded through bindview
+    currentProfile = '',       -- profile currently applied (display only)
+    autoLoad   = true,         -- on job change, apply that job's last-used or default profile
+    lastProfile = T{},         -- job abbr -> last profile loaded for that job
     position_x = 40,
     position_y = 300,
     -- Commands that are bound by the launcher / system and are not actions.
@@ -60,6 +62,9 @@ local bv = T{
     binds    = T{},
     -- lowercase key -> index into binds
     index    = {},
+    -- '/bind' commands bindview itself has queued but not yet seen come back
+    -- through the pipeline; used to tag those entries as profile-owned.
+    ownPending = {},
     positionApplied = false,
     configOpen = false,
 };
@@ -85,6 +90,7 @@ local cfg = {
     keyBadge   = { true },
     keyColor   = { 1.0, 0.95, 0.55, 1.0 },
     showProfileName = { true },
+    autoLoad   = { true },
 };
 
 local LAYOUT_NAMES = T{ 'Keyboard', 'Grid' };
@@ -106,6 +112,7 @@ local function SyncConfigFromSettings()
     cfg.layoutIndex[1] = (s.layout == 'grid') and 2 or 1;
     cfg.keyBadge[1] = (s.keyBadge ~= false);
     cfg.showProfileName[1] = (s.showProfileName ~= false);
+    cfg.autoLoad[1] = (s.autoLoad ~= false);
     local kc = s.keyColor or defaultSettings.keyColor;
     cfg.keyColor[1], cfg.keyColor[2], cfg.keyColor[3], cfg.keyColor[4] = kc[1], kc[2], kc[3], kc[4];
 end
@@ -127,6 +134,7 @@ local function SyncSettingsFromConfig()
     s.keyBadge   = cfg.keyBadge[1];
     s.keyColor   = T{ cfg.keyColor[1], cfg.keyColor[2], cfg.keyColor[3], cfg.keyColor[4] };
     s.showProfileName = cfg.showProfileName[1];
+    s.autoLoad = cfg.autoLoad[1];
 end
 
 settings.register('settings', 'settings_update', function(s)
@@ -578,7 +586,13 @@ local function AddBind(rawKey, command)
         action    = action,
         hidden    = IsIgnored(command),
         iconKey   = nil,   -- resolved lazily on first draw (needs resources ready)
+        own       = false, -- true when this bind was issued by a bindview profile
     };
+    local tag = key .. '\0' .. command;
+    if bv.ownPending[tag] then
+        entry.own = true;
+        bv.ownPending[tag] = nil;
+    end
     local existing = bv.index[key];
     if existing then
         bv.binds[existing] = entry;
@@ -651,49 +665,81 @@ end
 -- Profiles
 -- ============================================
 -- A profile is a snapshot of the visible binds (key + command) saved as a Lua
--- file under config/addons/bindview/profiles/. Loading one unbinds the keys
--- bindview currently tracks and re-issues /bind for each saved entry. Those
--- commands go through the same pipeline the watcher listens to, so the overlay
--- updates itself.
+-- file under config/addons/bindview/profiles/<JOB>/<name>.lua. Profiles are
+-- grouped by main job. Loading one unbinds the keys bindview currently tracks
+-- and re-issues /bind for each saved entry. Those commands go through the same
+-- pipeline the watcher listens to, so the overlay updates itself.
+--
+-- On a job change the job's last-used profile is applied, or its 'default'
+-- profile if one exists, when autoLoad is on.
 
-local function ProfileDir()
+local DEFAULT_PROFILE = 'default';
+
+-- Current main job abbreviation ('BLM'), or nil when not logged in.
+local function CurrentJob()
+    local player = AshitaCore:GetMemoryManager():GetPlayer();
+    if not player then return nil; end
+    local id = player:GetMainJob();
+    if not id or id == 0 then return nil; end
+    local abbr = AshitaCore:GetResourceManager():GetString('jobs.names_abbr', id);
+    if not abbr or abbr == '' then return nil; end
+    return abbr:upper();
+end
+
+local function ProfileRoot()
     return string.format('%sconfig\\addons\\%s\\profiles\\', AshitaCore:GetInstallPath(), addon.name);
+end
+
+local function ProfileDir(job)
+    return ProfileRoot() .. job .. '\\';
 end
 
 local function SanitizeProfileName(name)
     return (tostring(name or ''):gsub('[^%w%-_]', ''));
 end
 
-local function ProfilePath(name)
-    return ProfileDir() .. SanitizeProfileName(name) .. '.lua';
+local function ProfilePath(job, name)
+    return ProfileDir(job) .. SanitizeProfileName(name) .. '.lua';
 end
 
-local function ListProfiles()
+local function ListProfiles(job)
     local names = T{};
-    local dir = ProfileDir();
+    if not job then return names; end
+    local dir = ProfileDir(job);
     if not ashita.fs.exists(dir) then return names; end
     local files = ashita.fs.get_directory(dir, '.*\\.lua') or {};
     for _, file in ipairs(files) do
         names:append((file:gsub('%.lua$', '')));
     end
-    table.sort(names);
+    -- 'default' first, then alphabetical
+    table.sort(names, function(a, b)
+        if a == DEFAULT_PROFILE then return b ~= DEFAULT_PROFILE; end
+        if b == DEFAULT_PROFILE then return false; end
+        return a < b;
+    end);
     return names;
 end
 
+local function ProfileExists(job, name)
+    return job ~= nil and ashita.fs.exists(ProfilePath(job, name));
+end
+
 local function SaveProfile(name)
+    local job = CurrentJob();
+    if not job then return false, 'Not logged in; no job to save a profile for.'; end
     name = SanitizeProfileName(name);
     if name == '' then return false, 'Profile name must contain letters or numbers.'; end
 
-    local dir = ProfileDir();
-    if not ashita.fs.exists(dir) then
-        ashita.fs.create_directory(dir);
-    end
+    local root = ProfileRoot();
+    if not ashita.fs.exists(root) then ashita.fs.create_directory(root); end
+    local dir = ProfileDir(job);
+    if not ashita.fs.exists(dir) then ashita.fs.create_directory(dir); end
 
-    local file = io.open(ProfilePath(name), 'w');
+    local file = io.open(ProfilePath(job, name), 'w');
     if not file then return false, 'Could not write profile file.'; end
 
     local count = 0;
-    file:write('-- bindview profile. Each entry is issued as: /bind <key> <command>\n');
+    file:write(('-- bindview profile for %s. Each entry is issued as: /bind <key> <command>\n'):fmt(job));
     file:write('return {\n');
     for _, b in ipairs(bv.binds) do
         if not b.hidden then
@@ -706,9 +752,9 @@ local function SaveProfile(name)
     return true, count;
 end
 
-local function ReadProfile(name)
-    local path = ProfilePath(name);
-    if not ashita.fs.exists(path) then return nil, 'No profile named "' .. name .. '".'; end
+local function ReadProfile(job, name)
+    local path = ProfilePath(job, name);
+    if not ashita.fs.exists(path) then return nil, ('No %s profile named "%s".'):fmt(job, name); end
     local chunk, err = loadfile(path);
     if not chunk then return nil, 'Could not read profile: ' .. tostring(err); end
     local ok, data = pcall(chunk);
@@ -717,8 +763,10 @@ local function ReadProfile(name)
 end
 
 local function LoadProfile(name)
+    local job = CurrentJob();
+    if not job then return false, 'Not logged in; no job to load a profile for.'; end
     name = SanitizeProfileName(name);
-    local data, err = ReadProfile(name);
+    local data, err = ReadProfile(job, name);
     if not data then return false, err; end
 
     local cm = AshitaCore:GetChatManager();
@@ -733,32 +781,41 @@ local function LoadProfile(name)
     local count = 0;
     for _, entry in ipairs(data) do
         if type(entry) == 'table' and entry.key and entry.command then
+            bv.ownPending[entry.key:lower() .. '\0' .. entry.command] = true;
             cm:QueueCommand(1, string.format('/bind %s %s', entry.key, entry.command));
             count = count + 1;
         end
     end
 
     bv.settings.currentProfile = name;
+    if not bv.settings.lastProfile then bv.settings.lastProfile = T{}; end
+    bv.settings.lastProfile[job] = name;
     SaveSettings();
     return true, count;
 end
 
 local function DeleteProfile(name)
+    local job = CurrentJob();
+    if not job then return false, 'Not logged in.'; end
     name = SanitizeProfileName(name);
-    local path = ProfilePath(name);
-    if not ashita.fs.exists(path) then return false, 'No profile named "' .. name .. '".'; end
+    local path = ProfilePath(job, name);
+    if not ashita.fs.exists(path) then return false, ('No %s profile named "%s".'):fmt(job, name); end
     local ok = os.remove(path);
-    if ok and bv.settings.currentProfile == name then
-        bv.settings.currentProfile = '';
+    if ok then
+        if bv.settings.currentProfile == name then bv.settings.currentProfile = ''; end
+        if bv.settings.lastProfile and bv.settings.lastProfile[job] == name then
+            bv.settings.lastProfile[job] = nil;
+        end
         SaveSettings();
     end
     return ok ~= nil;
 end
 
--- Step through profiles alphabetically; direction is 1 or -1.
+-- Step through the current job's profiles; direction is 1 or -1.
 local function CycleProfile(direction)
-    local names = ListProfiles();
-    if #names == 0 then return false, 'No profiles saved yet.'; end
+    local job = CurrentJob();
+    local names = ListProfiles(job);
+    if #names == 0 then return false, ('No profiles saved for %s yet.'):fmt(job or 'this job'); end
     local current = bv.settings.currentProfile or '';
     local index = 0;
     for i, n in ipairs(names) do
@@ -770,6 +827,64 @@ local function CycleProfile(direction)
         index = ((index - 1 + direction) % #names) + 1;
     end
     return LoadProfile(names[index]);
+end
+
+-- Job change handling: poll the main job about once a second and, when it
+-- changes, apply the job's last-used profile or its default after a short
+-- delay so anything else that binds on job change (LuAshitacast) goes first.
+local jobWatch = { lastJob = nil, nextCheck = 0, pending = 0 };
+local JOB_CHANGE_DELAY = 2.0;
+
+local function ApplyJobProfile(job)
+    local s = bv.settings;
+    local name = s.lastProfile and s.lastProfile[job];
+    if not name or not ProfileExists(job, name) then
+        name = ProfileExists(job, DEFAULT_PROFILE) and DEFAULT_PROFILE or nil;
+    end
+    if not name then
+        s.currentProfile = '';
+        return;
+    end
+    local ok, result = LoadProfile(name);
+    if ok then
+        Message(('%s: applied profile "%s" (%d binds).'):fmt(job, name, result));
+    else
+        ErrorMessage(result);
+    end
+end
+
+local function CheckJobChange()
+    local now = os.clock();
+    if now < jobWatch.nextCheck then return; end
+    jobWatch.nextCheck = now + 1.0;
+
+    local job = CurrentJob();
+    if job == jobWatch.lastJob then return; end
+    local previousJob = jobWatch.lastJob;
+    jobWatch.lastJob = job;
+    bv.settings.currentProfile = '';
+
+    -- Profile binds belong to the job they were loaded for. Release the ones
+    -- bindview issued itself; binds set by anything else are left alone.
+    if previousJob ~= nil then
+        local cm = AshitaCore:GetChatManager();
+        for _, b in ipairs(bv.binds) do
+            if b.own then
+                cm:QueueCommand(1, '/unbind ' .. b.key);
+            end
+        end
+    end
+
+    if not job then return; end
+    if bv.settings.autoLoad == false then return; end
+    jobWatch.pending = jobWatch.pending + 1;
+    local ticket = jobWatch.pending;
+    ashita.tasks.once(JOB_CHANGE_DELAY, function()
+        -- Only the latest job change applies; ignore stale tasks.
+        if ticket ~= jobWatch.pending then return; end
+        if CurrentJob() ~= job then return; end
+        ApplyJobProfile(job);
+    end);
 end
 
 -- ============================================
@@ -789,8 +904,9 @@ local function PrintHelp()
         { '/bindview save <name>',   'Save the current binds as a profile.' },
         { '/bindview load <name>',   'Unbind tracked keys and apply a saved profile.' },
         { '/bindview next | prev',   'Cycle to the next or previous profile.' },
-        { '/bindview profiles',      'List saved profiles.' },
+        { '/bindview profiles',      'List saved profiles for the current job.' },
         { '/bindview delete <name>', 'Delete a saved profile.' },
+        { '/bindview auto on | off', 'Auto-apply a job profile on job change.' },
     };
     cmds:ieach(function(v)
         print(chat.header(addon.name):append(chat.message(v[1]):append(' - ')):append(chat.color1(6, v[2])));
@@ -867,14 +983,20 @@ ashita.events.register('command', 'command_cb', function(e)
             ErrorMessage(result);
         end
     elseif args[2]:any('profiles') then
-        local names = ListProfiles();
+        local job = CurrentJob();
+        local names = ListProfiles(job);
         if #names == 0 then
-            Message('No profiles saved yet. Use /bindview save <name>.');
+            Message(('No profiles saved for %s yet. Use /bindview save <name>.'):fmt(job or 'this job'));
+        else
+            Message(('%s profiles:'):fmt(job));
         end
         for _, n in ipairs(names) do
             local marker = (n == bv.settings.currentProfile) and '  (active)' or '';
-            Message(n .. marker);
+            Message('  ' .. n .. marker);
         end
+    elseif args[2]:any('auto') and #args >= 3 then
+        s.autoLoad = args[3]:any('on', 'true', '1', 'yes');
+        Message('Auto-load on job change: ' .. (s.autoLoad and 'on' or 'off'));
     elseif args[2]:any('delete') and #args >= 3 then
         local ok, err = DeleteProfile(args[3]);
         if ok then
@@ -1482,19 +1604,32 @@ local profileUi = {
     newName  = { '' },
     selected = nil,       -- selected profile name in the list
     names    = nil,       -- cached ListProfiles() result
+    job      = nil,       -- job the cached list belongs to
     status   = '',
 };
 local profileSectionChanged = false;
 
 local function RefreshProfileList()
-    profileUi.names = ListProfiles();
+    profileUi.job = CurrentJob();
+    profileUi.names = ListProfiles(profileUi.job);
 end
 
 local function DrawProfilesSection()
-    imgui.TextColored({ 1.0, 0.85, 0.4, 1.0 }, 'Profiles');
+    local job = CurrentJob();
+    imgui.TextColored({ 1.0, 0.85, 0.4, 1.0 }, ('Profiles  (%s)'):fmt(job or 'not logged in'));
 
     if imgui.Checkbox('Show profile name on overlay', cfg.showProfileName) then
         profileSectionChanged = true;
+    end
+    if imgui.Checkbox('Auto-apply job profile on job change', cfg.autoLoad) then
+        profileSectionChanged = true;
+    end
+    imgui.TextDisabled('Applies the job\'s last-used profile, or "default" if one exists.');
+
+    if profileUi.names == nil or profileUi.job ~= job then RefreshProfileList(); end
+    if not job then
+        imgui.TextDisabled('Log in to manage profiles.');
+        return;
     end
 
     -- Save current binds as a new profile
@@ -1512,7 +1647,14 @@ local function DrawProfilesSection()
         end
     end
 
-    if profileUi.names == nil then RefreshProfileList(); end
+    if not ProfileExists(job, DEFAULT_PROFILE) then
+        imgui.SameLine();
+        if imgui.Button('Save as default') then
+            local ok, result = SaveProfile(DEFAULT_PROFILE);
+            profileUi.status = ok and ('Saved %s default (%d binds).'):fmt(job, result) or result;
+            RefreshProfileList();
+        end
+    end
 
     -- Saved profiles list
     imgui.BeginChild('##profilelist', { 0, 90 }, ImGuiChildFlags_Borders);
@@ -1643,6 +1785,7 @@ local function DrawConfig()
 end
 
 ashita.events.register('d3d_present', 'present_cb', function()
+    CheckJobChange();
     DrawOverlay();
     DrawConfig();
 end);

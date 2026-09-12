@@ -48,8 +48,9 @@ must be loaded before whatever sets your binds.
 | `/bindview save <name>` | Save the current binds as a profile |
 | `/bindview load <name>` | Unbind tracked keys and apply a saved profile |
 | `/bindview next` / `prev` | Cycle to the next or previous profile |
-| `/bindview profiles` | List saved profiles |
+| `/bindview profiles` | List saved profiles for the current job |
 | `/bindview delete <name>` | Delete a saved profile |
+| `/bindview auto on` / `off` | Auto-apply a job profile on job change |
 
 Bind the toggle to a key from your profile if you want it on demand:
 
@@ -59,22 +60,37 @@ Bind the toggle to a key from your profile if you want it on demand:
 
 ## Profiles
 
-A profile is a snapshot of the binds bindview can currently see, saved under
-`config/addons/bindview/profiles/<name>.lua`. Loading a profile unbinds every
-key bindview is tracking and issues `/bind` for each saved entry. Hidden
-system binds are never touched. This is the one place the addon issues binds
-itself; everything else stays read-only.
+A profile is a snapshot of the binds bindview can currently see, saved per
+job under `config/addons/bindview/profiles/<JOB>/<name>.lua`. Loading a
+profile unbinds every key bindview is tracking and issues `/bind` for each
+saved entry. Hidden system binds are never touched. This is the one place the
+addon issues binds itself; everything else stays read-only.
 
-Profile switching is bindable, so you can flip layouts from the keyboard:
+Each job can have a `default` profile plus any number of named ones. With
+auto-apply on (the default), changing job applies that job's last-used
+profile, or its `default` if it has one, about two seconds after the change.
+Binds a profile issued are released again when you leave the job. Binds set by
+anything else, such as a LuAshitacast job profile, are left alone.
+
+Profile switching is bindable, so you can flip layouts from the keyboard. It
+cycles within the current job's profiles:
 
 ```
 /bind ^p /bindview next
 /bind ^o /bindview prev
 ```
 
-The active profile name is drawn above the slots. Note that anything else that
-sets binds, such as a LuAshitacast job change, will still override keys it
-manages.
+The active profile name is drawn above the slots.
+
+### Moving your binds out of LuAshitacast
+
+1. Change to the job while its LuAshitacast binds are still in place.
+2. Run `/bindview save default` (or press Save as default in the settings
+   window). The current binds are captured as that job's default.
+3. Remove the `SetBindings` / `UnsetBindings` calls from that job's
+   LuAshitacast profile.
+4. Repeat per job. From then on bindview applies the right default on every
+   job change, and you can add named variants alongside it.
 
 ## Settings window
 
