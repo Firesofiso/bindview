@@ -67,6 +67,7 @@ local bv = T{
     ownPending = {},
     positionApplied = false,
     configOpen = false,
+    profileListDirty = false,
 };
 
 local function SaveSettings()
@@ -1011,6 +1012,8 @@ ashita.events.register('command', 'command_cb', function(e)
         PrintHelp();
         return;
     end
+    -- Any command may have added, removed, or applied a profile.
+    bv.profileListDirty = true;
     SyncConfigFromSettings();
     SaveSettings();
 end);
@@ -1626,7 +1629,10 @@ local function DrawProfilesSection()
     end
     imgui.TextDisabled('Applies the job\'s last-used profile, or "default" if one exists.');
 
-    if profileUi.names == nil or profileUi.job ~= job then RefreshProfileList(); end
+    if profileUi.names == nil or profileUi.job ~= job or bv.profileListDirty then
+        RefreshProfileList();
+        bv.profileListDirty = false;
+    end
     if not job then
         imgui.TextDisabled('Log in to manage profiles.');
         return;
