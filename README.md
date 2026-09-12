@@ -7,6 +7,8 @@ keyboard, with the key drawn on each slot and recast timers on cooldown.
 It never sets, blocks, or executes a bind. Your keybinds keep living wherever
 they live today, for example in a LuAshitacast job profile.
 
+![Keyboard layout overlay showing bound keys as spell and ability icons](docs/overlay-keyboard.png)
+
 ## How it works
 
 Every command in Ashita, including the ones other addons queue, passes through
@@ -51,6 +53,8 @@ Bind the toggle to a key from your profile if you want it on demand:
 ```
 
 ## Settings window
+
+![Settings window with layout, display, and icon picker sections](docs/settings.png)
 
 - **Mode**: Keyboard places each slot where its key sits on a US QWERTY board,
   one board per modifier layer (plain, Shift, Ctrl, Alt), cropped to the keys
