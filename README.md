@@ -45,12 +45,36 @@ must be loaded before whatever sets your binds.
 | `/bindview list` | Print captured binds to chat |
 | `/bindview clear` | Forget every captured bind |
 | `/bindview reset` | Reset settings to defaults |
+| `/bindview save <name>` | Save the current binds as a profile |
+| `/bindview load <name>` | Unbind tracked keys and apply a saved profile |
+| `/bindview next` / `prev` | Cycle to the next or previous profile |
+| `/bindview profiles` | List saved profiles |
+| `/bindview delete <name>` | Delete a saved profile |
 
 Bind the toggle to a key from your profile if you want it on demand:
 
 ```
 /bind ^b /bindview toggle
 ```
+
+## Profiles
+
+A profile is a snapshot of the binds bindview can currently see, saved under
+`config/addons/bindview/profiles/<name>.lua`. Loading a profile unbinds every
+key bindview is tracking and issues `/bind` for each saved entry. Hidden
+system binds are never touched. This is the one place the addon issues binds
+itself; everything else stays read-only.
+
+Profile switching is bindable, so you can flip layouts from the keyboard:
+
+```
+/bind ^p /bindview next
+/bind ^o /bindview prev
+```
+
+The active profile name is drawn above the slots. Note that anything else that
+sets binds, such as a LuAshitacast job change, will still override keys it
+manages.
 
 ## Settings window
 

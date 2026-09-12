@@ -43,6 +43,8 @@ local defaultSettings = T{
     showEmptyKeys = true,      -- keyboard mode: draw faint slots for unbound keys
     keyBadge   = true,         -- solid dark badge behind the key label
     keyColor   = T{ 1.0, 0.95, 0.55, 1.0 },   -- key label color (RGBA 0-1)
+    showProfileName = true,    -- draw the active profile name above the slots
+    currentProfile = '',       -- last profile loaded through bindview
     position_x = 40,
     position_y = 300,
     -- Commands that are bound by the launcher / system and are not actions.
@@ -82,6 +84,7 @@ local cfg = {
     layoutIndex = { 1 },
     keyBadge   = { true },
     keyColor   = { 1.0, 0.95, 0.55, 1.0 },
+    showProfileName = { true },
 };
 
 local LAYOUT_NAMES = T{ 'Keyboard', 'Grid' };
@@ -102,6 +105,7 @@ local function SyncConfigFromSettings()
     cfg.showEmptyKeys[1] = (s.showEmptyKeys ~= false);
     cfg.layoutIndex[1] = (s.layout == 'grid') and 2 or 1;
     cfg.keyBadge[1] = (s.keyBadge ~= false);
+    cfg.showProfileName[1] = (s.showProfileName ~= false);
     local kc = s.keyColor or defaultSettings.keyColor;
     cfg.keyColor[1], cfg.keyColor[2], cfg.keyColor[3], cfg.keyColor[4] = kc[1], kc[2], kc[3], kc[4];
 end
@@ -122,6 +126,7 @@ local function SyncSettingsFromConfig()
     s.layout     = LAYOUT_VALUES[cfg.layoutIndex[1]] or 'keyboard';
     s.keyBadge   = cfg.keyBadge[1];
     s.keyColor   = T{ cfg.keyColor[1], cfg.keyColor[2], cfg.keyColor[3], cfg.keyColor[4] };
+    s.showProfileName = cfg.showProfileName[1];
 end
 
 settings.register('settings', 'settings_update', function(s)
@@ -631,12 +636,145 @@ local function HandleUnbindCommand(commandText)
 end
 
 -- ============================================
--- Commands
+-- Messages
 -- ============================================
 
 local function Message(text)
     print(chat.header(addon.name):append(chat.message(text)));
 end
+
+local function ErrorMessage(text)
+    print(chat.header(addon.name):append(chat.error(text)));
+end
+
+-- ============================================
+-- Profiles
+-- ============================================
+-- A profile is a snapshot of the visible binds (key + command) saved as a Lua
+-- file under config/addons/bindview/profiles/. Loading one unbinds the keys
+-- bindview currently tracks and re-issues /bind for each saved entry. Those
+-- commands go through the same pipeline the watcher listens to, so the overlay
+-- updates itself.
+
+local function ProfileDir()
+    return string.format('%sconfig\\addons\\%s\\profiles\\', AshitaCore:GetInstallPath(), addon.name);
+end
+
+local function SanitizeProfileName(name)
+    return (tostring(name or ''):gsub('[^%w%-_]', ''));
+end
+
+local function ProfilePath(name)
+    return ProfileDir() .. SanitizeProfileName(name) .. '.lua';
+end
+
+local function ListProfiles()
+    local names = T{};
+    local dir = ProfileDir();
+    if not ashita.fs.exists(dir) then return names; end
+    local files = ashita.fs.get_directory(dir, '.*\\.lua') or {};
+    for _, file in ipairs(files) do
+        names:append((file:gsub('%.lua$', '')));
+    end
+    table.sort(names);
+    return names;
+end
+
+local function SaveProfile(name)
+    name = SanitizeProfileName(name);
+    if name == '' then return false, 'Profile name must contain letters or numbers.'; end
+
+    local dir = ProfileDir();
+    if not ashita.fs.exists(dir) then
+        ashita.fs.create_directory(dir);
+    end
+
+    local file = io.open(ProfilePath(name), 'w');
+    if not file then return false, 'Could not write profile file.'; end
+
+    local count = 0;
+    file:write('-- bindview profile. Each entry is issued as: /bind <key> <command>\n');
+    file:write('return {\n');
+    for _, b in ipairs(bv.binds) do
+        if not b.hidden then
+            file:write(string.format('    { key = %q, command = %q },\n', b.key, b.command));
+            count = count + 1;
+        end
+    end
+    file:write('}\n');
+    file:close();
+    return true, count;
+end
+
+local function ReadProfile(name)
+    local path = ProfilePath(name);
+    if not ashita.fs.exists(path) then return nil, 'No profile named "' .. name .. '".'; end
+    local chunk, err = loadfile(path);
+    if not chunk then return nil, 'Could not read profile: ' .. tostring(err); end
+    local ok, data = pcall(chunk);
+    if not ok or type(data) ~= 'table' then return nil, 'Profile file is not valid.'; end
+    return data;
+end
+
+local function LoadProfile(name)
+    name = SanitizeProfileName(name);
+    local data, err = ReadProfile(name);
+    if not data then return false, err; end
+
+    local cm = AshitaCore:GetChatManager();
+
+    -- Release everything bindview currently tracks (never the hidden system binds).
+    for _, b in ipairs(bv.binds) do
+        if not b.hidden then
+            cm:QueueCommand(1, '/unbind ' .. b.key);
+        end
+    end
+
+    local count = 0;
+    for _, entry in ipairs(data) do
+        if type(entry) == 'table' and entry.key and entry.command then
+            cm:QueueCommand(1, string.format('/bind %s %s', entry.key, entry.command));
+            count = count + 1;
+        end
+    end
+
+    bv.settings.currentProfile = name;
+    SaveSettings();
+    return true, count;
+end
+
+local function DeleteProfile(name)
+    name = SanitizeProfileName(name);
+    local path = ProfilePath(name);
+    if not ashita.fs.exists(path) then return false, 'No profile named "' .. name .. '".'; end
+    local ok = os.remove(path);
+    if ok and bv.settings.currentProfile == name then
+        bv.settings.currentProfile = '';
+        SaveSettings();
+    end
+    return ok ~= nil;
+end
+
+-- Step through profiles alphabetically; direction is 1 or -1.
+local function CycleProfile(direction)
+    local names = ListProfiles();
+    if #names == 0 then return false, 'No profiles saved yet.'; end
+    local current = bv.settings.currentProfile or '';
+    local index = 0;
+    for i, n in ipairs(names) do
+        if n == current then index = i; break; end
+    end
+    if index == 0 then
+        index = (direction > 0) and 1 or #names;
+    else
+        index = ((index - 1 + direction) % #names) + 1;
+    end
+    return LoadProfile(names[index]);
+end
+
+-- ============================================
+-- Commands
+-- ============================================
 
 local function PrintHelp()
     Message('Commands:');
@@ -648,6 +786,11 @@ local function PrintHelp()
         { '/bindview list',          'Print the captured binds to chat.' },
         { '/bindview clear',         'Forget every captured bind.' },
         { '/bindview reset',         'Reset settings to defaults.' },
+        { '/bindview save <name>',   'Save the current binds as a profile.' },
+        { '/bindview load <name>',   'Unbind tracked keys and apply a saved profile.' },
+        { '/bindview next | prev',   'Cycle to the next or previous profile.' },
+        { '/bindview profiles',      'List saved profiles.' },
+        { '/bindview delete <name>', 'Delete a saved profile.' },
     };
     cmds:ieach(function(v)
         print(chat.header(addon.name):append(chat.message(v[1]):append(' - ')):append(chat.color1(6, v[2])));
@@ -702,6 +845,43 @@ ashita.events.register('command', 'command_cb', function(e)
     elseif args[2]:any('clear') then
         ClearBinds();
         Message('Cleared.');
+    elseif args[2]:any('save') and #args >= 3 then
+        local ok, result = SaveProfile(args[3]);
+        if ok then
+            Message(('Saved profile "%s" (%d binds).'):fmt(SanitizeProfileName(args[3]), result));
+        else
+            ErrorMessage(result);
+        end
+    elseif args[2]:any('load') and #args >= 3 then
+        local ok, result = LoadProfile(args[3]);
+        if ok then
+            Message(('Loaded profile "%s" (%d binds).'):fmt(SanitizeProfileName(args[3]), result));
+        else
+            ErrorMessage(result);
+        end
+    elseif args[2]:any('next', 'prev', 'previous') then
+        local ok, result = CycleProfile(args[2]:any('next') and 1 or -1);
+        if ok then
+            Message(('Profile: %s'):fmt(bv.settings.currentProfile));
+        else
+            ErrorMessage(result);
+        end
+    elseif args[2]:any('profiles') then
+        local names = ListProfiles();
+        if #names == 0 then
+            Message('No profiles saved yet. Use /bindview save <name>.');
+        end
+        for _, n in ipairs(names) do
+            local marker = (n == bv.settings.currentProfile) and '  (active)' or '';
+            Message(n .. marker);
+        end
+    elseif args[2]:any('delete') and #args >= 3 then
+        local ok, err = DeleteProfile(args[3]);
+        if ok then
+            Message(('Deleted profile "%s".'):fmt(SanitizeProfileName(args[3])));
+        else
+            ErrorMessage(err or 'Could not delete profile.');
+        end
     elseif args[2]:any('reset') then
         settings.reset();
         Message('Settings reset.');
@@ -1089,6 +1269,11 @@ local function DrawOverlay()
             if not b.hidden then visible:append(b); end
         end
 
+        local profileName = bv.settings.currentProfile or '';
+        if s.showProfileName ~= false and profileName ~= '' then
+            imgui.TextColored({ 1.0, 0.82, 0.53, 1.0 }, profileName);
+        end
+
         if #visible == 0 then
             imgui.TextDisabled('No binds captured');
         else
@@ -1290,6 +1475,88 @@ local function DrawIconPicker()
 end
 
 -- ============================================
+-- Profiles section (config window)
+-- ============================================
+
+local profileUi = {
+    newName  = { '' },
+    selected = nil,       -- selected profile name in the list
+    names    = nil,       -- cached ListProfiles() result
+    status   = '',
+};
+local profileSectionChanged = false;
+
+local function RefreshProfileList()
+    profileUi.names = ListProfiles();
+end
+
+local function DrawProfilesSection()
+    imgui.TextColored({ 1.0, 0.85, 0.4, 1.0 }, 'Profiles');
+
+    if imgui.Checkbox('Show profile name on overlay', cfg.showProfileName) then
+        profileSectionChanged = true;
+    end
+
+    -- Save current binds as a new profile
+    imgui.InputText('##newprofile', profileUi.newName, 32);
+    imgui.SameLine();
+    if imgui.Button('Save as') then
+        local ok, result = SaveProfile(profileUi.newName[1]);
+        if ok then
+            profileUi.status = ('Saved "%s" (%d binds).'):fmt(SanitizeProfileName(profileUi.newName[1]), result);
+            profileUi.selected = SanitizeProfileName(profileUi.newName[1]);
+            profileUi.newName[1] = '';
+            RefreshProfileList();
+        else
+            profileUi.status = result;
+        end
+    end
+
+    if profileUi.names == nil then RefreshProfileList(); end
+
+    -- Saved profiles list
+    imgui.BeginChild('##profilelist', { 0, 90 }, ImGuiChildFlags_Borders);
+    if #profileUi.names == 0 then
+        imgui.TextDisabled('No profiles yet.');
+    end
+    for i, name in ipairs(profileUi.names) do
+        local label = name;
+        if name == bv.settings.currentProfile then label = name .. '  (active)'; end
+        if imgui.Selectable(label .. '##profile' .. i, profileUi.selected == name) then
+            profileUi.selected = name;
+        end
+    end
+    imgui.EndChild();
+
+    local hasSelection = profileUi.selected ~= nil and profileUi.names:contains(profileUi.selected);
+    if not hasSelection then
+        imgui.TextDisabled('Select a profile to load, overwrite, or delete.');
+    else
+        if imgui.Button('Load') then
+            local ok, result = LoadProfile(profileUi.selected);
+            profileUi.status = ok and ('Loaded "%s" (%d binds).'):fmt(profileUi.selected, result) or result;
+        end
+        imgui.SameLine();
+        if imgui.Button('Overwrite') then
+            local ok, result = SaveProfile(profileUi.selected);
+            profileUi.status = ok and ('Overwrote "%s" (%d binds).'):fmt(profileUi.selected, result) or result;
+        end
+        imgui.SameLine();
+        if imgui.Button('Delete') then
+            local ok, err = DeleteProfile(profileUi.selected);
+            profileUi.status = ok and ('Deleted "%s".'):fmt(profileUi.selected) or (err or 'Could not delete.');
+            profileUi.selected = nil;
+            RefreshProfileList();
+        end
+    end
+
+    if profileUi.status ~= '' then
+        imgui.TextDisabled(profileUi.status);
+    end
+    imgui.TextDisabled('Bind cycling with: /bind ^p /bindview next');
+end
+
+-- ============================================
 -- Config window
 -- ============================================
 
@@ -1352,6 +1619,13 @@ local function DrawConfig()
         end
 
         imgui.TextDisabled(('%d binds captured'):fmt(#bv.binds));
+
+        imgui.Separator();
+        DrawProfilesSection();
+        if profileSectionChanged then
+            profileSectionChanged = false;
+            changed = true;
+        end
 
         imgui.Separator();
         DrawIconPicker();
