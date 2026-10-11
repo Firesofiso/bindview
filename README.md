@@ -69,8 +69,15 @@ addon issues binds itself; everything else stays read-only.
 Each job can have a `default` profile plus any number of named ones. With
 auto-apply on (the default), changing job applies that job's last-used
 profile, or its `default` if it has one, about two seconds after the change.
-Binds a profile issued are released again when you leave the job. Binds set by
-anything else, such as a LuAshitacast job profile, are left alone.
+
+bindview only ever releases binds it issued itself. Loading a profile unbinds
+the previous profile's keys and binds the new ones; binds set by anything
+else, such as a LuAshitacast job profile or a manual `/bind`, are left alone.
+On a job change the previous job's profile binds are released after the same
+delay, so anything that rebinds on job change goes first and keeps its keys.
+
+If binds ever seem to go missing, `/bindview debug` prints every bind and
+unbind the addon sees, with job changes and profile loads, to chat.
 
 Profile switching is bindable, so you can flip layouts from the keyboard. It
 cycles within the current job's profiles:

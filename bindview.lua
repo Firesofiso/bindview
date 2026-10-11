@@ -76,6 +76,15 @@ local function SaveSettings()
     settings.save();
 end
 
+-- Debug trace of bind traffic and job changes: /bindview debug
+-- Defined early because the bind parser below reports through it.
+local debugEnabled = false;
+local function Debug(text)
+    if debugEnabled then
+        print(chat.header(addon.name):append(chat.color1(6, '[debug] ' .. text)));
+    end
+end
+
 -- Config window widget buffers (ImGui wants tables it can write into)
 local cfg = {
     visible    = { true },
@@ -599,6 +608,7 @@ local function AddBind(rawKey, command)
         entry.own = true;
         bv.ownPending[tag] = nil;
     end
+    Debug(('bind %s -> %s%s'):fmt(rawKey, command, entry.own and '  [profile]' or ''));
     local existing = bv.index[key];
     if existing then
         bv.binds[existing] = entry;
@@ -617,6 +627,7 @@ end
 
 local function RemoveBind(rawKey)
     local idx = bv.index[rawKey:lower()];
+    Debug(('unbind %s%s'):fmt(rawKey, idx and '' or '  (not tracked)'));
     if not idx then return; end
     table.remove(bv.binds, idx);
     RebuildIndex();
@@ -798,6 +809,32 @@ local function ReadProfile(job, name)
     return data;
 end
 
+-- Queue /unbind for every bind bindview issued itself (own == true). Binds set
+-- by anything else, such as a LuAshitacast profile or a manual /bind, are
+-- never touched. Returns the number of unbinds queued. Pass cm to batch into
+-- an already-open silent section; otherwise this opens and closes its own.
+local function ReleaseOwnBinds(cm)
+    local released = 0;
+    local standalone = (cm == nil);
+    for _, b in ipairs(bv.binds) do
+        if b.own and not b.system then
+            if released == 0 then
+                if standalone then
+                    cm = AshitaCore:GetChatManager();
+                    BeginSilentBinds();
+                end
+            end
+            cm:QueueCommand(1, '/unbind ' .. b.key);
+            released = released + 1;
+        end
+    end
+    if standalone and released > 0 then
+        QueueSilentEnd(cm);
+    end
+    Debug(('released %d own bind(s)'):fmt(released));
+    return released;
+end
+
 local function LoadProfile(name)
     local job = CurrentJob();
     if not job then return false, 'Not logged in; no job to load a profile for.'; end
@@ -808,12 +845,9 @@ local function LoadProfile(name)
     local cm = AshitaCore:GetChatManager();
     BeginSilentBinds();
 
-    -- Release everything bindview currently tracks (never the system binds).
-    for _, b in ipairs(bv.binds) do
-        if not b.system then
-            cm:QueueCommand(1, '/unbind ' .. b.key);
-        end
-    end
+    -- Only binds from a previous bindview profile are released. Keys the new
+    -- profile also uses are simply rebound below; everything else is kept.
+    ReleaseOwnBinds(cm);
 
     local count = 0;
     for _, entry in ipairs(data) do
@@ -824,6 +858,7 @@ local function LoadProfile(name)
         end
     end
     QueueSilentEnd(cm);
+    Debug(('load "%s/%s": queued %d bind(s)'):fmt(job, name, count));
 
     bv.settings.currentProfile = name;
     if not bv.settings.lastProfile then bv.settings.lastProfile = T{}; end
@@ -873,6 +908,7 @@ end
 local jobWatch = { lastJob = nil, nextCheck = 0, pending = 0 };
 local JOB_CHANGE_DELAY = 2.0;
 
+-- Returns true when a profile was applied for the job.
 local function ApplyJobProfile(job)
     local s = bv.settings;
     local name = s.lastProfile and s.lastProfile[job];
@@ -881,14 +917,16 @@ local function ApplyJobProfile(job)
     end
     if not name then
         s.currentProfile = '';
-        return;
+        Debug(('%s: no profile to apply'):fmt(job));
+        return false;
     end
     local ok, result = LoadProfile(name);
     if ok then
         Message(('%s: applied profile "%s" (%d binds).'):fmt(job, name, result));
-    else
-        ErrorMessage(result);
+        return true;
     end
+    ErrorMessage(result);
+    return false;
 end
 
 local function CheckJobChange()
@@ -903,23 +941,12 @@ local function CheckJobChange()
     local previousJob = jobWatch.lastJob;
     jobWatch.lastJob = job;
     bv.settings.currentProfile = '';
+    Debug(('job change: %s -> %s'):fmt(previousJob or 'none', job));
 
-    -- Profile binds belong to the job they were loaded for. Release the ones
-    -- bindview issued itself; binds set by anything else are left alone.
-    if previousJob ~= nil then
-        local cm = AshitaCore:GetChatManager();
-        local any = false;
-        for _, b in ipairs(bv.binds) do
-            if b.own then
-                if not any then BeginSilentBinds(); any = true; end
-                cm:QueueCommand(1, '/unbind ' .. b.key);
-            end
-        end
-        if any then QueueSilentEnd(cm); end
-    end
-
-    if not job then return; end
-    if bv.settings.autoLoad == false then return; end
+    -- Everything happens after the delay, so anything else that binds on a
+    -- job change (LuAshitacast) has gone first. By then any key it rebound
+    -- has lost its "own" flag and is kept; only leftover profile binds from
+    -- the previous job are released.
     jobWatch.pending = jobWatch.pending + 1;
     local ticket = jobWatch.pending;
     local function TryApply()
@@ -932,7 +959,14 @@ local function CheckJobChange()
             return;
         end
         if current ~= job then return; end
-        ApplyJobProfile(job);
+
+        local applied = false;
+        if bv.settings.autoLoad ~= false then
+            applied = ApplyJobProfile(job);   -- releases own binds itself
+        end
+        if not applied and previousJob ~= nil then
+            ReleaseOwnBinds();
+        end
     end
     ashita.tasks.once(JOB_CHANGE_DELAY, TryApply);
 end
@@ -957,6 +991,7 @@ local function PrintHelp()
         { '/bindview profiles',      'List saved profiles for the current job.' },
         { '/bindview delete <name>', 'Delete a saved profile.' },
         { '/bindview auto on | off', 'Auto-apply a job profile on job change.' },
+        { '/bindview debug',         'Toggle a chat trace of bind traffic and job changes.' },
     };
     cmds:ieach(function(v)
         print(chat.header(addon.name):append(chat.message(v[1]):append(' - ')):append(chat.color1(6, v[2])));
@@ -1056,6 +1091,9 @@ ashita.events.register('command', 'command_cb', function(e)
             local marker = (n == bv.settings.currentProfile) and '  (active)' or '';
             Message('  ' .. n .. marker);
         end
+    elseif args[2]:any('debug') then
+        debugEnabled = not debugEnabled;
+        Message('Debug trace: ' .. (debugEnabled and 'on' or 'off'));
     elseif args[2]:any('auto') and #args >= 3 then
         s.autoLoad = args[3]:any('on', 'true', '1', 'yes');
         Message('Auto-load on job change: ' .. (s.autoLoad and 'on' or 'off'));
