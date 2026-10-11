@@ -51,7 +51,8 @@ local defaultSettings = T{
     position_x = 40,
     position_y = 300,
     -- Commands that are bound by the launcher / system and are not actions.
-    -- A bind whose command starts with one of these is hidden.
+    -- A bind whose command starts with one of these is a system bind: it is
+    -- still shown, but profiles never save or unbind it.
     ignore     = T{ '/ashita', '/screenshot', '/paste', '/ambient', '/fps', '/ta ', '/bindview' },
     -- Manual icon choices, keyed by lowercase bind key: { kind = 'spell'|'ability'|'item'|'misc', value = <index|id|filename> }
     iconOverrides = T{},
@@ -59,7 +60,7 @@ local defaultSettings = T{
 
 local bv = T{
     settings = settings.load(defaultSettings),
-    -- Ordered list of { key, label, command, action, hidden, icon }
+    -- Ordered list of { key, label, command, action, system, icon }
     binds    = T{},
     -- lowercase key -> index into binds
     index    = {},
@@ -589,7 +590,7 @@ local function AddBind(rawKey, command)
         longKey   = FormatKeyLong(rawKey),
         command   = command,
         action    = action,
-        hidden    = IsIgnored(command),
+        system    = IsIgnored(command),
         iconKey   = nil,   -- resolved lazily on first draw (needs resources ready)
         own       = false, -- true when this bind was issued by a bindview profile
     };
@@ -777,7 +778,7 @@ local function SaveProfile(name)
     file:write(('-- bindview profile for %s. Each entry is issued as: /bind <key> <command>\n'):fmt(job));
     file:write('return {\n');
     for _, b in ipairs(bv.binds) do
-        if not b.hidden then
+        if not b.system then
             file:write(string.format('    { key = %q, command = %q },\n', b.key, b.command));
             count = count + 1;
         end
@@ -807,9 +808,9 @@ local function LoadProfile(name)
     local cm = AshitaCore:GetChatManager();
     BeginSilentBinds();
 
-    -- Release everything bindview currently tracks (never the hidden system binds).
+    -- Release everything bindview currently tracks (never the system binds).
     for _, b in ipairs(bv.binds) do
-        if not b.hidden then
+        if not b.system then
             cm:QueueCommand(1, '/unbind ' .. b.key);
         end
     end
@@ -896,7 +897,9 @@ local function CheckJobChange()
     jobWatch.nextCheck = now + 1.0;
 
     local job = CurrentJob();
-    if job == jobWatch.lastJob then return; end
+    -- The job reads as 0 while zoning (and at the login screen). Treat that as
+    -- "unknown", not a change, or every zone would unbind and reapply the profile.
+    if job == nil or job == jobWatch.lastJob then return; end
     local previousJob = jobWatch.lastJob;
     jobWatch.lastJob = job;
     bv.settings.currentProfile = '';
@@ -919,12 +922,19 @@ local function CheckJobChange()
     if bv.settings.autoLoad == false then return; end
     jobWatch.pending = jobWatch.pending + 1;
     local ticket = jobWatch.pending;
-    ashita.tasks.once(JOB_CHANGE_DELAY, function()
+    local function TryApply()
         -- Only the latest job change applies; ignore stale tasks.
         if ticket ~= jobWatch.pending then return; end
-        if CurrentJob() ~= job then return; end
+        local current = CurrentJob();
+        if current == nil then
+            -- Mid-zone (e.g. changed job then left the Mog House); wait it out.
+            ashita.tasks.once(1.0, TryApply);
+            return;
+        end
+        if current ~= job then return; end
         ApplyJobProfile(job);
-    end);
+    end
+    ashita.tasks.once(JOB_CHANGE_DELAY, TryApply);
 end
 
 -- ============================================
@@ -934,8 +944,8 @@ end
 local function PrintHelp()
     Message('Commands:');
     local cmds = T{
-        { '/bindview',               'Toggle the overlay.' },
-        { '/bindview config',        'Open the settings window.' },
+        { '/bindview | /bv',         'Open the settings window.' },
+        { '/bindview toggle',        'Show or hide the overlay.' },
         { '/bindview show | hide',   'Show or hide the overlay.' },
         { '/bindview lock | unlock', 'Lock or unlock the overlay position.' },
         { '/bindview list',          'Print the captured binds to chat.' },
@@ -968,10 +978,18 @@ ashita.events.register('command', 'command_cb', function(e)
     end
 
     local args = e.command:args();
-    if #args == 0 or args[1]:lower() ~= '/bindview' then
+    if #args == 0 then return; end
+    local cmdWord = args[1]:lower();
+    if cmdWord ~= '/bindview' and cmdWord ~= '/bv' then
         return;
     end
     e.blocked = true;
+
+    -- '/bindview' or '/bv' on its own opens the settings window; '/bv <sub>'
+    -- behaves exactly like '/bindview <sub>'.
+    if #args == 1 then
+        args[2] = 'config';
+    end
 
     -- Internal marker queued after a batch of binds: restore the silent flag.
     if #args == 2 and args[2] == '_endsilent' then
@@ -980,7 +998,7 @@ ashita.events.register('command', 'command_cb', function(e)
     end
 
     local s = bv.settings;
-    if #args == 1 or args[2]:any('toggle') then
+    if args[2]:any('toggle') then
         s.visible = not s.visible;
     elseif args[2]:any('config', 'cfg', 'settings') then
         bv.configOpen = not bv.configOpen;
@@ -1000,9 +1018,7 @@ ashita.events.register('command', 'command_cb', function(e)
             Message('No binds captured yet.');
         end
         for _, b in ipairs(bv.binds) do
-            if not b.hidden then
-                Message(('%s  %s'):fmt(b.longKey, b.command));
-            end
+            Message(('%s  %s'):fmt(b.longKey, b.command));
         end
     elseif args[2]:any('clear') then
         ClearBinds();
@@ -1434,10 +1450,7 @@ local function DrawOverlay()
             s.position_y = y;
         end
 
-        local visible = T{};
-        for _, b in ipairs(bv.binds) do
-            if not b.hidden then visible:append(b); end
-        end
+        local visible = bv.binds;
 
         local profileName = bv.settings.currentProfile or '';
         if s.showProfileName ~= false and profileName ~= '' then
